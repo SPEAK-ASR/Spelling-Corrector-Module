@@ -87,6 +87,32 @@ GRAMMAR_SUFFIX_ERRORS = {
 
 
 # ============================================================================
+# TEXT CLEANING FUNCTIONS
+# ============================================================================
+
+def remove_punctuation(text: str) -> str:
+    """
+    Remove punctuation marks from text.
+    
+    Args:
+        text: The text to clean
+        
+    Returns:
+        Text with punctuation removed
+    """
+    # Common punctuation marks to remove
+    punctuation = r'[.,!?;:"\'\-\(\)\[\]\{\}<>@#$%^&*+=|\\~`/]'
+    
+    # Remove punctuation
+    cleaned = re.sub(punctuation, '', text)
+    
+    # Clean up extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
+
+
+# ============================================================================
 # ERROR GENERATION FUNCTIONS
 # ============================================================================
 
@@ -473,7 +499,7 @@ def generate_training_data(
 
     with open(output_csv_path, 'w', encoding='utf-8', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['correct_sentence', 'noisy_sentence'])
+        writer.writerow(['noisy_sentence', 'correct_sentence'])
 
         for i, clean_sentence in enumerate(chunks):
             num_errors = get_error_count_by_distribution()
@@ -489,7 +515,13 @@ def generate_training_data(
             else:
                 noisy_sentence = generate_noisy_sentence(clean_sentence, num_errors=num_errors)
 
-            writer.writerow([clean_sentence, noisy_sentence])
+            # Remove punctuation from both sentences
+            clean_sentence = remove_punctuation(clean_sentence)
+            noisy_sentence = remove_punctuation(noisy_sentence)
+
+            # Only write if sentences are not empty after cleaning
+            if clean_sentence and noisy_sentence:
+                writer.writerow([noisy_sentence, clean_sentence])
 
             if (i + 1) % 1000 == 0:
                 print(f"   Processed {i + 1:,}/{len(chunks):,} chunks...")
@@ -571,8 +603,8 @@ Examples:
     parser.add_argument('--input-folder', '-i', type=str, help='Input folder containing text files')
     parser.add_argument('--output', '-o', type=str, help='Output CSV file path')
     parser.add_argument('--extension', '-e', type=str, default='.txt', help='File extension to process (default: .txt)')
-    parser.add_argument('--max-words', type=int, default=15, help='Maximum words per chunk (default: 15)')
-    parser.add_argument('--min-words', type=int, default=5, help='Minimum words per chunk (default: 5)')
+    parser.add_argument('--max-words', type=int, default=4, help='Maximum words per chunk (default: 4)')
+    parser.add_argument('--min-words', type=int, default=2, help='Minimum words per chunk (default: 2)')
     parser.add_argument('--demo', action='store_true', help='Run demonstration of error types')
 
     args = parser.parse_args()
