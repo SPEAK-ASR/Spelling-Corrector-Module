@@ -168,3 +168,5 @@ models/*.pth
 *.bak
 temp/
 tmp/
+
+*.txt
