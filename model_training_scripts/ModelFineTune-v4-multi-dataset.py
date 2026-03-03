@@ -38,9 +38,9 @@ from transformers import (
 
 
 DEFAULT_DATASET_IDS = [
-    "SPEAK-PP/sinhala-spelling-correction-already-corrected-pairs",
+    # "SPEAK-PP/sinhala-spelling-correction-already-corrected-pairs",
     "SPEAK-PP/openslr-sinhala-spelling-correction-prediction-reference",
-    "SPEAK-PP/sinhala-itn-dataset",
+    # "SPEAK-PP/sinhala-itn-dataset",
 ]
 
 TARGET_FEATURES = Features(
