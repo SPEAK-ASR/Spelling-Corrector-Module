@@ -142,9 +142,11 @@ def login_hf(hf_token: str) -> bool:
         return False
 
     try:
+        print("token:", token)
         login(token=token, add_to_git_credential=True)
         # user_info = whoami()
-        logger.info("Hugging Face logged in as: %s", user_info.get('name', 'unknown'))
+        # logger.info("Hugging Face logged in as: %s", user_info.get('name', 'unknown'))
+        logger.info("Hugging Face authentication successful.")
         return True
     except HfHubHTTPError as exc:
         logger.error("HF authentication failed: %s", exc)
