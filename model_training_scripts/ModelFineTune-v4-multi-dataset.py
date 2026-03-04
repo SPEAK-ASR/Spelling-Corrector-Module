@@ -143,7 +143,7 @@ def login_hf(hf_token: str) -> bool:
 
     try:
         login(token=token, add_to_git_credential=True)
-        user_info = whoami()
+        # user_info = whoami()
         logger.info("Hugging Face logged in as: %s", user_info.get('name', 'unknown'))
         return True
     except HfHubHTTPError as exc:
