@@ -64,18 +64,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-input-length", type=int, default=128)
     parser.add_argument("--max-target-length", type=int, default=128)
     parser.add_argument("--per-device-train-batch-size", type=int, default=32)
-    parser.add_argument("--per-device-eval-batch-size", type=int, default=16)
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=32)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--num-epochs", type=int, default=5)
+    parser.add_argument("--num-epochs", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--eval-steps", type=int, default=500)
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="outputs/mbart-model-v4-multi")
     parser.add_argument(
-        "--hub-model-id", default="SPEAK-ASR/mBART-large-50-si-spelling-v4-multi"
+        "--hub-model-id", default="SPEAK-PP/mBART-large-50-si-spelling-v4-multi"
     )
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hf-token", default="")
@@ -392,10 +392,10 @@ def main() -> None:
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
+        eval_strategy="epoch",
+        # eval_steps=args.eval_steps,
+        save_strategy="epoch",
+        # save_steps=args.save_steps,
         save_total_limit=3,
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
