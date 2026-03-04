@@ -16,7 +16,10 @@ Background run on Windows PowerShell:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import evaluate
@@ -52,6 +55,8 @@ TARGET_FEATURES = Features(
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -77,12 +82,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hub-model-id", default="SPEAK-PP/mBART-large-50-si-spelling-v4-multi"
     )
-    parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hf-token", default="")
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--prefer-directml", action="store_true")
     parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--log-dir", default="logs")
     return parser.parse_args()
+
+
+def setup_logging(log_dir: str | Path) -> None:
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"finetune_v4_{timestamp}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
+    logger.info("Logging to: %s", log_file)
 
 
 def select_device(prefer_directml: bool = False):
@@ -91,10 +115,10 @@ def select_device(prefer_directml: bool = False):
             import torch_directml
 
             device = torch_directml.device()
-            print("Device backend: DirectML")
+            logger.info("Device backend: DirectML")
             return device, "directml"
         except Exception as exc:
-            print(f"DirectML not available ({exc}). Falling back to torch backend.")
+            logger.warning("DirectML not available (%s). Falling back to torch backend.", exc)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -102,28 +126,28 @@ def select_device(prefer_directml: bool = False):
         hip_ver = getattr(torch.version, "hip", None)
         cuda_ver = getattr(torch.version, "cuda", None)
         if hip_ver:
-            print(f"Device backend: ROCm | GPU: {device_name} | HIP: {hip_ver}")
+            logger.info("Device backend: ROCm | GPU: %s | HIP: %s", device_name, hip_ver)
         else:
-            print(f"Device backend: CUDA | GPU: {device_name} | CUDA: {cuda_ver}")
+            logger.info("Device backend: CUDA | GPU: %s | CUDA: %s", device_name, cuda_ver)
         return device, "cuda"
 
-    print("Device backend: CPU")
+    logger.info("Device backend: CPU")
     return torch.device("cpu"), "cpu"
 
 
 def login_hf(hf_token: str) -> bool:
     token = hf_token.strip() or os.environ.get("HF_TOKEN", "").strip()
     if not token:
-        print("HF token not found. Set --hf-token or HF_TOKEN env var.")
+        logger.warning("HF token not found. Set --hf-token or HF_TOKEN env var.")
         return False
 
     try:
         login(token=token, add_to_git_credential=True)
         user_info = whoami()
-        print(f"Hugging Face logged in as: {user_info.get('name', 'unknown')}")
+        logger.info("Hugging Face logged in as: %s", user_info.get('name', 'unknown'))
         return True
     except HfHubHTTPError as exc:
-        print(f"HF authentication failed: {exc}")
+        logger.error("HF authentication failed: %s", exc)
         return False
 
 
@@ -175,13 +199,13 @@ def normalize_pair_columns(ds_split: Dataset) -> Dataset:
 
 
 def load_and_merge_datasets(dataset_ids: list[str], seed: int) -> DatasetDict:
-    print("[STEP 1] Loading + combining datasets")
+    logger.info("[STEP 1] Loading + combining datasets")
 
     train_parts, eval_parts, test_parts = [], [], []
 
     for dataset_id in dataset_ids:
         ds = load_dataset(dataset_id)
-        print(f"Loaded {dataset_id} splits: {list(ds.keys())}")
+        logger.info("Loaded %s splits: %s", dataset_id, list(ds.keys()))
 
         if "train" in ds:
             train_parts.append(normalize_pair_columns(ds["train"]))
@@ -213,16 +237,16 @@ def load_and_merge_datasets(dataset_ids: list[str], seed: int) -> DatasetDict:
         }
     )
 
-    print("✓ Combined splits:")
+    logger.info("✓ Combined splits:")
     for split_name in ["train", "eval", "test"]:
-        print(f"  {split_name}: {len(merged[split_name])}")
-    print("Columns:", merged["train"].column_names)
+        logger.info("  %s: %d", split_name, len(merged[split_name]))
+    logger.info("Columns: %s", merged["train"].column_names)
 
     return merged
 
 
 def preprocess_and_tokenize(dataset: DatasetDict, tokenizer, args) -> tuple[Dataset, Dataset, Dataset]:
-    print("[STEP 2] Tokenizing & preparing datasets...")
+    logger.info("[STEP 2] Tokenizing & preparing datasets...")
 
     def preprocess_function(examples):
         input_texts, target_texts = [], []
@@ -282,10 +306,10 @@ def preprocess_and_tokenize(dataset: DatasetDict, tokenizer, args) -> tuple[Data
     eval_dataset = dataset_tok["eval"]
     test_dataset = dataset_tok["test"]
 
-    print("✓ Tokenized split sizes:")
-    print("  Train:", len(train_dataset))
-    print("  Eval :", len(eval_dataset))
-    print("  Test :", len(test_dataset))
+    logger.info("✓ Tokenized split sizes:")
+    logger.info("  Train: %d", len(train_dataset))
+    logger.info("  Eval : %d", len(eval_dataset))
+    logger.info("  Test : %d", len(test_dataset))
 
     return train_dataset, eval_dataset, test_dataset
 
@@ -345,23 +369,23 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
+    setup_logging(args.log_dir)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device, backend = select_device(prefer_directml=args.prefer_directml)
 
-    hf_logged_in = False
-    if args.push_to_hub:
-        hf_logged_in = login_hf(args.hf_token)
+    hf_logged_in = login_hf(args.hf_token)
 
     use_wandb = args.use_wandb
     if use_wandb and not os.environ.get("WANDB_API_KEY", "").strip():
-        print("WANDB_API_KEY not found. Disabling W&B logging.")
+        logger.warning("WANDB_API_KEY not found. Disabling W&B logging.")
         use_wandb = False
 
     dataset = load_and_merge_datasets(args.dataset_ids, seed=args.seed)
 
-    print("[STEP 3] Loading tokenizer + model")
+    logger.info("[STEP 3] Loading tokenizer + model")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
     tokenizer.src_lang = args.source_lang
     tokenizer.tgt_lang = args.target_lang
@@ -381,7 +405,7 @@ def main() -> None:
     use_fp16, use_bf16 = get_precision_flags(device, backend)
     report_to = ["wandb"] if use_wandb else []
 
-    print(f"Precision settings -> fp16: {use_fp16}, bf16: {use_bf16}")
+    logger.info("Precision settings -> fp16: %s, bf16: %s", use_fp16, use_bf16)
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=str(output_dir),
@@ -397,7 +421,7 @@ def main() -> None:
         save_strategy="epoch",
         # save_steps=args.save_steps,
         save_total_limit=3,
-        push_to_hub=args.push_to_hub,
+        push_to_hub=hf_logged_in,
         hub_model_id=args.hub_model_id,
         hub_strategy="checkpoint",
         logging_steps=25,
@@ -406,8 +430,8 @@ def main() -> None:
         fp16=use_fp16,
         bf16=use_bf16,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        metric_for_best_model="eval_bleu",
+        greater_is_better=True,
         report_to=report_to,
         dataloader_num_workers=4,
         dataloader_pin_memory=(backend == "cuda"),
@@ -431,16 +455,16 @@ def main() -> None:
     except TypeError:
         trainer = Seq2SeqTrainer(**trainer_kwargs, tokenizer=tokenizer)
 
-    print("[STEP 4] Training...")
+    logger.info("[STEP 4] Training...")
     train_result = trainer.train()
-    print("✓ Training done")
-    print("Training loss:", train_result.training_loss)
+    logger.info("✓ Training done")
+    logger.info("Training loss: %s", train_result.training_loss)
 
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
-    print("Saved to:", output_dir)
+    logger.info("Saved to: %s", output_dir)
 
-    print("[STEP 5] Testing...")
+    logger.info("[STEP 5] Testing...")
     prediction_output = trainer.predict(test_dataset)
     decoded_predictions = tokenizer.batch_decode(
         prediction_output.predictions, skip_special_tokens=True
@@ -456,24 +480,23 @@ def main() -> None:
     exact = np.mean(
         [pred.strip() == label.strip() for pred, label in zip(decoded_predictions, decoded_labels)]
     )
-    print("Exact match (test):", round(float(exact) * 100, 2), "%")
+    logger.info("Exact match (test): %.2f %%", round(float(exact) * 100, 2))
 
-    if args.push_to_hub:
-        if hf_logged_in:
-            print("Pushing to hub:", args.hub_model_id)
-            try:
-                trainer.push_to_hub(
-                    language="si",
-                    finetuned_from=args.model_name,
-                    model_name=args.hub_model_id,
-                    dataset=", ".join(args.dataset_ids),
-                )
-                print("✓ Pushed")
-            except HfHubHTTPError as exc:
-                print("✗ Push failed with Hugging Face API error.")
-                print("Reason:", exc)
-        else:
-            print("Skipping push_to_hub (not logged in).")
+    if hf_logged_in:
+        logger.info("Pushing to hub: %s", args.hub_model_id)
+        try:
+            trainer.push_to_hub(
+                language="si",
+                finetuned_from=args.model_name,
+                model_name=args.hub_model_id,
+                dataset=", ".join(args.dataset_ids),
+            )
+            logger.info("✓ Pushed")
+        except HfHubHTTPError as exc:
+            logger.error("✗ Push failed with Hugging Face API error.")
+            logger.error("Reason: %s", exc)
+    else:
+        logger.warning("Skipping push_to_hub (not logged in).")
 
 
 if __name__ == "__main__":
