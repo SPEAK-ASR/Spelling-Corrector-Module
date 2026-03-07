@@ -42,7 +42,7 @@ from transformers import (
 
 DEFAULT_DATASET_IDS = [
     # "SPEAK-PP/sinhala-spelling-correction-already-corrected-pairs",
-    "SPEAK-PP/openslr-sinhala-spelling-correction-prediction-reference",
+    "SPEAK-PP/openslr-sinhala-spelling-correction-prediction-reference-60000",
     # "SPEAK-PP/sinhala-itn-dataset",
 ]
 
@@ -78,9 +78,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-steps", type=int, default=500)
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", default="outputs/mbart-model-v4-multi")
+    parser.add_argument("--output-dir", default="outputs/mbart-model-v5-multi")
     parser.add_argument(
-        "--hub-model-id", default="SPEAK-PP/mBART-large-50-si-spelling-v4-multi"
+        "--hub-model-id", default="SPEAK-PP/mBART-large-50-si-spelling-v5-multi"
     )
     parser.add_argument("--hf-token", default="")
     parser.add_argument("--use-wandb", action="store_true")
@@ -95,7 +95,7 @@ def setup_logging(log_dir: str | Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"finetune_v4_{timestamp}.log"
+    log_file = log_dir / f"finetune_v5_{timestamp}.log"
 
     logging.basicConfig(
         level=logging.INFO,
@@ -144,8 +144,8 @@ def login_hf(hf_token: str) -> bool:
     try:
         print("token:", token)
         login(token=token, add_to_git_credential=True)
-        # user_info = whoami()
-        # logger.info("Hugging Face logged in as: %s", user_info.get('name', 'unknown'))
+        user_info = whoami()
+        logger.info("Hugging Face logged in as: %s", user_info.get('name', 'unknown'))
         logger.info("Hugging Face authentication successful.")
         return True
     except HfHubHTTPError as exc:
