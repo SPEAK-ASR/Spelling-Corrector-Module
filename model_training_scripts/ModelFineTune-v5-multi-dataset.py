@@ -22,10 +22,11 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
-import evaluate
+import sacrebleu as _sacrebleu
 import numpy as np
 import torch
 from datasets import Dataset, DatasetDict, Features, Value, concatenate_datasets, load_dataset
@@ -110,6 +111,34 @@ def setup_logging(log_dir: str | Path) -> None:
     logger.info("Logging to: %s", log_file)
 
 
+def log_args(args: argparse.Namespace) -> None:
+    """Log all parsed CLI arguments."""
+    logger.info("=" * 60)
+    logger.info("Run configuration (arguments):")
+    for key, value in sorted(vars(args).items()):
+        logger.info("  %-35s %s", key, value)
+    logger.info("=" * 60)
+
+
+def count_parameters(model) -> tuple[int, int]:
+    """Return (total_params, trainable_params)."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def log_gpu_memory(tag: str = "") -> None:
+    """Log current GPU memory usage (only when CUDA is available)."""
+    if not torch.cuda.is_available():
+        return
+    allocated = torch.cuda.memory_allocated() / 1024 ** 3
+    reserved = torch.cuda.memory_reserved() / 1024 ** 3
+    total_mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    label = f"[GPU memory{' – ' + tag if tag else ''}]"
+    logger.info("%s allocated=%.2f GB | reserved=%.2f GB | total=%.2f GB",
+                label, allocated, reserved, total_mem)
+
+
 def select_device(prefer_directml: bool = False):
     if prefer_directml:
         try:
@@ -126,13 +155,16 @@ def select_device(prefer_directml: bool = False):
         device_name = torch.cuda.get_device_name(0)
         hip_ver = getattr(torch.version, "hip", None)
         cuda_ver = getattr(torch.version, "cuda", None)
+        cap_major, cap_minor = torch.cuda.get_device_capability(0)
         if hip_ver:
             logger.info("Device backend: ROCm | GPU: %s | HIP: %s", device_name, hip_ver)
         else:
-            logger.info("Device backend: CUDA | GPU: %s | CUDA: %s", device_name, cuda_ver)
+            logger.info("Device backend: CUDA | GPU: %s | CUDA: %s | Compute capability: %d.%d",
+                        device_name, cuda_ver, cap_major, cap_minor)
+        log_gpu_memory("after device init")
         return device, "cuda"
 
-    logger.info("Device backend: CPU")
+    logger.info("Device backend: CPU | torch version: %s", torch.__version__)
     return torch.device("cpu"), "cpu"
 
 
@@ -202,20 +234,30 @@ def normalize_pair_columns(ds_split: Dataset) -> Dataset:
 
 def load_and_merge_datasets(dataset_ids: list[str], seed: int) -> DatasetDict:
     logger.info("[STEP 1] Loading + combining datasets")
+    logger.info("  Datasets requested (%d): %s", len(dataset_ids), dataset_ids)
+    t0 = time.time()
 
     train_parts: list[Dataset] = []
     eval_parts: list[Dataset] = []
 
     for dataset_id in dataset_ids:
         ds = load_dataset(dataset_id)
-        logger.info("Loaded %s splits: %s", dataset_id, list(ds.keys()))
+        logger.info("Loaded '%s' — available splits: %s", dataset_id, list(ds.keys()))
 
         if "train" in ds:
-            train_parts.append(normalize_pair_columns(ds["train"]))
+            part = normalize_pair_columns(ds["train"])
+            logger.info("  train rows from '%s': %d", dataset_id, len(part))
+            train_parts.append(part)
+        else:
+            logger.warning("  No 'train' split found in '%s' — skipping.", dataset_id)
 
         eval_split = get_eval_split(ds)
         if eval_split is not None:
-            eval_parts.append(normalize_pair_columns(eval_split))
+            part = normalize_pair_columns(eval_split)
+            logger.info("  eval  rows from '%s': %d", dataset_id, len(part))
+            eval_parts.append(part)
+        else:
+            logger.info("  No eval/validation split in '%s'.", dataset_id)
 
     if not train_parts:
         raise ValueError("No train split found across the provided datasets.")
@@ -229,6 +271,7 @@ def load_and_merge_datasets(dataset_ids: list[str], seed: int) -> DatasetDict:
         split = train_merged.train_test_split(test_size=0.1, seed=seed)
         train_merged = split["train"]
         eval_merged = split["test"]
+        logger.info("  Auto-split eval rows: %d", len(eval_merged))
 
     merged = DatasetDict(
         {
@@ -237,16 +280,20 @@ def load_and_merge_datasets(dataset_ids: list[str], seed: int) -> DatasetDict:
         }
     )
 
-    logger.info("✓ Combined splits:")
+    elapsed = time.time() - t0
+    logger.info("✓ Combined dataset ready (%.1fs):", elapsed)
     for split_name in ["train", "eval"]:
-        logger.info("  %s: %d", split_name, len(merged[split_name]))
-    logger.info("Columns: %s", merged["train"].column_names)
+        logger.info("  %-6s : %d rows", split_name, len(merged[split_name]))
+    logger.info("  Columns: %s", merged["train"].column_names)
 
     return merged
 
 
 def preprocess_and_tokenize(dataset: DatasetDict, tokenizer, args) -> tuple[Dataset, Dataset]:
     logger.info("[STEP 2] Tokenizing & preparing datasets...")
+    logger.info("  max_input_length=%d | max_target_length=%d",
+                args.max_input_length, args.max_target_length)
+    t0 = time.time()
 
     def preprocess_function(examples):
         input_texts, target_texts = [], []
@@ -300,14 +347,19 @@ def preprocess_and_tokenize(dataset: DatasetDict, tokenizer, args) -> tuple[Data
             and len(ex["labels"]) > 0
         )
 
+    pre_filter_train = len(dataset_tok["train"])
+    pre_filter_eval = len(dataset_tok["eval"])
     dataset_tok = dataset_tok.filter(keep_nonempty)
 
     train_dataset = dataset_tok["train"]
     eval_dataset = dataset_tok["eval"]
 
-    logger.info("✓ Tokenized split sizes:")
-    logger.info("  Train: %d", len(train_dataset))
-    logger.info("  Eval : %d", len(eval_dataset))
+    elapsed = time.time() - t0
+    logger.info("✓ Tokenization done (%.1fs):", elapsed)
+    logger.info("  Train: %d  (dropped %d empty)", len(train_dataset),
+                pre_filter_train - len(train_dataset))
+    logger.info("  Eval : %d  (dropped %d empty)", len(eval_dataset),
+                pre_filter_eval - len(eval_dataset))
 
     return train_dataset, eval_dataset
 
@@ -331,8 +383,6 @@ def get_precision_flags(device, backend: str) -> tuple[bool, bool]:
 
 
 def build_compute_metrics(tokenizer):
-    sacrebleu = evaluate.load("sacrebleu")
-
     def postprocess_text(predictions, labels):
         predictions = [text.strip() for text in predictions]
         labels = [[text.strip()] for text in labels]
@@ -351,9 +401,9 @@ def build_compute_metrics(tokenizer):
             decoded_predictions, decoded_labels
         )
 
-        bleu = sacrebleu.compute(
-            predictions=decoded_predictions, references=decoded_labels
-        )["score"]
+        bleu = _sacrebleu.corpus_bleu(
+            decoded_predictions, [decoded_labels]
+        ).score
         exact = np.mean(
             [pred == label[0] for pred, label in zip(decoded_predictions, decoded_labels)]
         )
@@ -364,13 +414,24 @@ def build_compute_metrics(tokenizer):
 
 
 def main() -> None:
+    run_start = time.time()
     args = parse_args()
     set_seed(args.seed)
 
     setup_logging(args.log_dir)
 
+    logger.info("=" * 60)
+    logger.info("mBART Fine-tuning v5 (multi-dataset)")
+    logger.info("Started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("Python: %s", sys.version)
+    logger.info("PyTorch: %s", torch.__version__)
+    logger.info("=" * 60)
+
+    log_args(args)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory: %s", output_dir.resolve())
 
     device, backend = select_device(prefer_directml=args.prefer_directml)
 
@@ -383,15 +444,27 @@ def main() -> None:
 
     dataset = load_and_merge_datasets(args.dataset_ids, seed=args.seed)
 
-    logger.info("[STEP 3] Loading tokenizer + model")
+    logger.info("[STEP 3] Loading tokenizer + model: %s", args.model_name)
+    t_model = time.time()
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
     tokenizer.src_lang = args.source_lang
     tokenizer.tgt_lang = args.target_lang
+    logger.info("  Tokenizer vocab size: %d", tokenizer.vocab_size)
+    logger.info("  src_lang=%s | tgt_lang=%s", args.source_lang, args.target_lang)
 
+    log_gpu_memory("before model load")
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
     lang_token_id = tokenizer.convert_tokens_to_ids([args.target_lang])[0]
     model.config.decoder_start_token_id = lang_token_id
     model = model.to(device)
+    log_gpu_memory("after model load")
+
+    total_params, trainable_params = count_parameters(model)
+    logger.info("  Total parameters   : %s  (%.2f M)",
+                f"{total_params:,}", total_params / 1e6)
+    logger.info("  Trainable parameters: %s  (%.2f M)",
+                f"{trainable_params:,}", trainable_params / 1e6)
+    logger.info("  Model loaded in %.1fs", time.time() - t_model)
 
     train_dataset, eval_dataset = preprocess_and_tokenize(dataset, tokenizer, args)
 
@@ -444,22 +517,70 @@ def main() -> None:
         ],
     )
 
+    # Log effective batch size and estimated training steps
+    effective_batch = (
+        args.per_device_train_batch_size * args.gradient_accumulation_steps
+    )
+    steps_per_epoch = max(1, len(train_dataset) // effective_batch)
+    total_steps = steps_per_epoch * args.num_epochs
+    logger.info("=" * 60)
+    logger.info("Training configuration summary:")
+    logger.info("  Model                    : %s", args.model_name)
+    logger.info("  Train samples            : %d", len(train_dataset))
+    logger.info("  Eval  samples            : %d", len(eval_dataset))
+    logger.info("  Epochs                   : %d", args.num_epochs)
+    logger.info("  Per-device train batch   : %d", args.per_device_train_batch_size)
+    logger.info("  Gradient accum steps     : %d", args.gradient_accumulation_steps)
+    logger.info("  Effective batch size     : %d", effective_batch)
+    logger.info("  Est. steps/epoch         : %d", steps_per_epoch)
+    logger.info("  Est. total steps         : %d", total_steps)
+    logger.info("  Learning rate            : %g", args.learning_rate)
+    logger.info("  Warmup steps             : %d", args.warmup_steps)
+    logger.info("  Weight decay             : %g", args.weight_decay)
+    logger.info("  Early stopping patience  : %d", args.early_stopping_patience)
+    logger.info("  fp16=%s | bf16=%s", use_fp16, use_bf16)
+    logger.info("  Output dir               : %s", output_dir.resolve())
+    logger.info("  Hub model id             : %s", args.hub_model_id)
+    logger.info("  W&B enabled              : %s", use_wandb)
+    logger.info("=" * 60)
+
     try:
         trainer = Seq2SeqTrainer(**trainer_kwargs, processing_class=tokenizer)
     except TypeError:
         trainer = Seq2SeqTrainer(**trainer_kwargs, tokenizer=tokenizer)
 
-    logger.info("[STEP 4] Training...")
+    logger.info("[STEP 4] Training started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    t_train = time.time()
     train_result = trainer.train()
-    logger.info("✓ Training done")
-    logger.info("Training loss: %s", train_result.training_loss)
+    train_elapsed = time.time() - t_train
 
+    logger.info("=" * 60)
+    logger.info("✓ Training finished: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("  Wall time            : %.1f s  (%.2f min)", train_elapsed, train_elapsed / 60)
+    logger.info("  Training loss        : %.6f", train_result.training_loss)
+    logger.info("  Total steps done     : %d", train_result.global_step)
+    if train_result.metrics:
+        logger.info("  Full training metrics:")
+        for k, v in sorted(train_result.metrics.items()):
+            logger.info("    %-35s %s", k, v)
+    log_gpu_memory("after training")
+    logger.info("=" * 60)
+
+    logger.info("[STEP 5] Final evaluation on eval split...")
+    t_eval = time.time()
+    eval_results = trainer.evaluate()
+    eval_elapsed = time.time() - t_eval
+    logger.info("✓ Evaluation done (%.1fs):", eval_elapsed)
+    for k, v in sorted(eval_results.items()):
+        logger.info("  %-35s %s", k, v)
+
+    logger.info("[STEP 6] Saving model and tokenizer...")
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
-    logger.info("Saved to: %s", output_dir)
+    logger.info("  Saved to: %s", output_dir.resolve())
 
     if hf_logged_in:
-        logger.info("Pushing to hub: %s", args.hub_model_id)
+        logger.info("[STEP 7] Pushing to hub: %s", args.hub_model_id)
         try:
             trainer.push_to_hub(
                 language="si",
@@ -467,12 +588,18 @@ def main() -> None:
                 model_name=args.hub_model_id,
                 dataset=", ".join(args.dataset_ids),
             )
-            logger.info("✓ Pushed")
+            logger.info("✓ Pushed to hub successfully.")
         except HfHubHTTPError as exc:
             logger.error("✗ Push failed with Hugging Face API error.")
             logger.error("Reason: %s", exc)
     else:
         logger.warning("Skipping push_to_hub (not logged in).")
+
+    total_elapsed = time.time() - run_start
+    logger.info("=" * 60)
+    logger.info("Run complete: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("Total wall time: %.1f s  (%.2f min)", total_elapsed, total_elapsed / 60)
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
